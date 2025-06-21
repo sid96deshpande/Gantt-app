@@ -2,3 +2,4 @@ openai
 streamlit
 python-docx
 openpyxl
+PyPDF2>=3.0.0
