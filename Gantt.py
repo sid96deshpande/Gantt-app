@@ -140,9 +140,7 @@ Below is a mix of text and tables extracted from a project scope document (Word/
 {{"project_start_date":"2025-01-01","tasks":[{{"task":1,"description":"Site survey: initial visit","assigned_to":"Site Engineer","start":"2025-01-01","end":"2025-01-02","costs":{{"labour":100,"material":20,"equipment":0,"travel":10,"misc":0}}}}]}}
 Project Scope:\"\"\"{scope_text}\"\"\"
     """
-    # Update for OpenAI >=1.0.0 syntax:
-    client = openai.OpenAI(api_key=st.secrets["openai_api_key"])
-    response = client.chat.completions.create(
+    response = openai.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0
