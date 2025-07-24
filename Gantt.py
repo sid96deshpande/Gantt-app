@@ -189,13 +189,14 @@ def fill_gantt_excel(template_path, output_path, start_date, tasks):
 
 def get_market_price(item):
     prices = {
-        "labour": 25,
-        "material": 50,
+        "labour": {"hour": 8, "per_hr": 25, "total": 200},
+        "material": {"units": 5, "per_unit": 50, "total": 250},
         "travel": 10,
         "equipment": 30,
-        "misc": 15,
+        "fixed": 0,
+        "misc": 15
     }
-    return prices.get(str(item).lower(), 20)
+    return prices.get(item, {})
 
 def fill_budget_excel(template_path, output_path, project_name, start_date, tasks):
     wb = load_workbook(template_path)
@@ -203,27 +204,92 @@ def fill_budget_excel(template_path, output_path, project_name, start_date, task
     sd = parse_date(start_date) or datetime.today().date()
     ws["C3"] = project_name
     ws["D3"] = sd
+
     for i, task in enumerate(tasks):
         row = 8 + i
-        ws[f"B{row}"] = parse_task_number(task["task"])
-        ws[f"C{row}"] = task["description"]
-        start = parse_date(task.get("start")) or sd
-        ws[f"E{row}"] = start
         costs = task.get("costs", {})
-        ws[f"H{row}"] = 8
-        ws[f"I{row}"] = ensure_number(costs.get("labour", get_market_price("labour")))
-        ws[f"J{row}"] = ws[f"H{row}"].value * ws[f"I{row}"].value
-        ws[f"K{row}"] = 5
-        ws[f"L{row}"] = ensure_number(costs.get("material", get_market_price("material")))
-        ws[f"M{row}"] = ws[f"K{row}"].value * ws[f"L{row}"].value
-        ws[f"N{row}"] = ensure_number(costs.get("travel", get_market_price("travel")))
-        ws[f"O{row}"] = ensure_number(costs.get("equipment", get_market_price("equipment")))
-        ws[f"P{row}"] = 100
-        ws[f"Q{row}"] = ensure_number(costs.get("misc", get_market_price("misc")))
-        ws[f"R{row}"] = sum(ensure_number(ws[f"{col}{row}"].value) for col in "NOPQ")
-        ws[f"S{row}"] = 500
-        ws[f"T{row}"] = 480
-        ws[f"U{row}"] = ws[f"S{row}"].value - ws[f"T{row}"].value
+        description = task.get("description", "")
+        ws[f"C{row}"] = description  # Description Project
+
+        start = parse_date(task.get("start")) or sd
+        ws[f"E{row}"] = start  # Planned Start Date
+        # F = Actual Start Date (leave blank)
+        end = parse_date(task.get("end")) or None
+        ws[f"G{row}"] = end  # End Date
+
+        # ---- LABOUR LOGIC ----
+        # If both hours and per hour cost are provided
+        hours = None
+        per_hr = None
+        labour_total = None
+        if isinstance(costs.get("labour"), dict):
+            labour_cost = costs["labour"]
+            hours = labour_cost.get("hours")
+            per_hr = labour_cost.get("per_hr")
+            labour_total = labour_cost.get("total")
+        else:
+            labour_total = costs.get("labour")
+
+        if hours:
+            ws[f"H{row}"] = hours
+            ws[f"I{row}"] = per_hr or get_market_price("labour")["per_hr"]
+        elif per_hr:
+            ws[f"I{row}"] = per_hr
+            ws[f"H{row}"] = get_market_price("labour")["hour"]
+        else:
+            ws[f"H{row}"] = get_market_price("labour")["hour"]
+            ws[f"I{row}"] = get_market_price("labour")["per_hr"]
+
+        # If only total is given, just enter total in Labour Total
+        if labour_total and not (hours or per_hr):
+            ws[f"J{row}"] = labour_total
+
+        # ---- MATERIALS LOGIC ----
+        units = None
+        per_unit = None
+        materials_total = None
+        if isinstance(costs.get("material"), dict):
+            material_cost = costs["material"]
+            units = material_cost.get("units")
+            per_unit = material_cost.get("per_unit")
+            materials_total = material_cost.get("total")
+        else:
+            materials_total = costs.get("material")
+
+        if units:
+            ws[f"K{row}"] = units
+            ws[f"L{row}"] = per_unit or get_market_price("material")["per_unit"]
+        elif per_unit:
+            ws[f"L{row}"] = per_unit
+            ws[f"K{row}"] = get_market_price("material")["units"]
+        else:
+            ws[f"K{row}"] = get_market_price("material")["units"]
+            ws[f"L{row}"] = get_market_price("material")["per_unit"]
+
+        # If only total is given, just enter total in Materials Total
+        if materials_total and not (units or per_unit):
+            ws[f"M{row}"] = materials_total
+
+        # ---- OTHER COSTS LOGIC ----
+        travel = costs.get("travel")
+        equipment = costs.get("equipment")
+        fixed = costs.get("fixed")
+        misc = costs.get("misc")
+        # Travel (N)
+        ws[f"N{row}"] = travel if travel is not None else get_market_price("travel")
+        # Equipment (O)
+        ws[f"O{row}"] = equipment if equipment is not None else get_market_price("equipment")
+        # Fixed (P)
+        ws[f"P{row}"] = fixed if fixed is not None else get_market_price("fixed")
+        # Misc (Q)
+        ws[f"Q{row}"] = misc if misc is not None else get_market_price("misc")
+        # Other Total (R) - leave as formula, but if unknown costs, sum into R
+        # Budget (S)
+        ws[f"S{row}"] = task.get("budget", "")
+
+        # T = Actual (leave as formula)
+        # U = Under/Over (leave as formula)
+
     wb.save(output_path)
 
 def cleanup_temp_files():
