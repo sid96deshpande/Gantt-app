@@ -162,7 +162,7 @@ def to_number(val):
 # -------------------- LLM EXTRACTION --------------------
 def extract_tasks_with_gpt(scope_text):
     """
-    Ask the LLM to extract project_name, project_start_date, tasks, and any per-task estimated cost.
+    Ask the LLM to extract project_name, project_start_date, tasks, per-task budget/estimate, and total budget if present.
     """
     prompt = f"""
 You are an AI project agent.
@@ -171,22 +171,24 @@ Below is text+tables extracted from a project scope (Word/PDF).
 Return ONLY valid minified JSON with keys:
 - "project_name": short title of the project (string; if unclear, infer best concise title)
 - "project_start_date": YYYY-MM-DD (if missing/unclear, use earliest detectable date; else null)
+- "project_total_budget": number or null (if a single total project budget is specified anywhere)
 - "tasks": array of objects with:
   - "task": number/id (e.g., 1, 2, 1.1)
   - "description": short (<= 80 chars)
   - "assigned_to": string ("" if missing)
   - "start": YYYY-MM-DD or null
   - "end": YYYY-MM-DD or null
-  - "estimated_cost": number (if the scope provides an explicit estimated cost for this task; else null)
+  - "estimated_cost": number or null (explicit estimate for this task, if given)
+  - "budget": number or null (explicit budget for this task, if given)
 
-Rules:
+Notes:
+- Budgets/estimates can appear anywhere, including at the end; parse carefully from text or tables.
 - Ranges like "12–18 June" => inclusive in year 2025 unless a year is explicit.
 - If no dates for a task, set start/end to null.
-- If estimated cost appears in text or tables, capture it as a pure number (no currency symbols).
-- Output ONLY JSON, no commentary.
+- Emit ONLY JSON, no commentary.
 
 Example:
-{{"project_name":"Example Project","project_start_date":"2025-01-01","tasks":[{{"task":1,"description":"Site survey","assigned_to":"Site Eng","start":"2025-01-01","end":"2025-01-02","estimated_cost":1200}}]}}
+{{"project_name":"Example Project","project_start_date":"2025-01-01","project_total_budget":120000,"tasks":[{{"task":1,"description":"Site survey","assigned_to":"Site Eng","start":"2025-01-01","end":"2025-01-02","estimated_cost":1200,"budget":1000}}]}}
 
 Project Scope:
 \"\"\"{scope_text}\"\"\"
@@ -271,7 +273,7 @@ def _baseline_labour_material(costs):
         else:
             mat_total = get_market_price("material").get("units", 5) * get_market_price("material").get("per_unit", 50)
 
-    return float(lab_total), float(mat_total)
+    return float(labour_total := lab_total), float(material_total := mat_total)
 
 def _other_components(costs):
     """Return a dict of other components with numbers filled from scope or market defaults."""
@@ -348,7 +350,7 @@ def fill_gantt_excel(template_path, output_path, project_name, start_date, tasks
 
     wb.save(output_path)
 
-def fill_budget_excel(template_path, output_path, project_name, start_date, tasks):
+def fill_budget_excel(template_path, output_path, project_name, start_date, tasks, total_budget=None):
     wb = load_workbook(template_path)
     ws = wb.active
 
@@ -356,6 +358,10 @@ def fill_budget_excel(template_path, output_path, project_name, start_date, task
     sd = parse_date(start_date) or datetime.today().date()
     ws["C3"] = sanitize_title(project_name) or "Project"
     ws["D3"] = sd
+
+    n_tasks = len(tasks)
+    any_per_task_budget = False
+    wrote_any_budget = False
 
     for i, task in enumerate(tasks):
         row = 8 + i
@@ -406,7 +412,7 @@ def fill_budget_excel(template_path, output_path, project_name, start_date, task
             ws[f"M{row}"] = material_final
             ws[f"T{row}"] = actual_total
 
-        # ---- NEW: Back-solve Hours & £/Hr so H*I == J ----
+        # ---- Back-solve Hours & £/Hr so H*I == J ----
         hours_in = None
         rate_in = None
         if isinstance(costs.get("labour"), dict):
@@ -418,7 +424,7 @@ def fill_budget_excel(template_path, output_path, project_name, start_date, task
         ws[f"H{row}"] = hours
         ws[f"I{row}"] = rate
 
-        # ---- NEW: Back-solve Units & £/Unit so K*L == M ----
+        # ---- Back-solve Units & £/Unit so K*L == M ----
         units_in = None
         unit_price_in = None
         if isinstance(costs.get("material"), dict):
@@ -430,10 +436,22 @@ def fill_budget_excel(template_path, output_path, project_name, start_date, task
         ws[f"K{row}"] = units
         ws[f"L{row}"] = unit_price
 
-        # Keep existing behavior for S (Budget)
-        ws[f"S{row}"] = task.get("budget", "")
+        # ---- Budget column (S) per new rules ----
+        per_task_budget = to_number(task.get("budget"))
+        if per_task_budget is not None:
+            any_per_task_budget = True
+            ws[f"S{row}"] = per_task_budget
+            wrote_any_budget = True
+        elif total_budget is not None and n_tasks > 0:
+            equal_share = round(float(total_budget) / n_tasks, 2)
+            ws[f"S{row}"] = equal_share
+            wrote_any_budget = True
+        # else: leave blank
 
     wb.save(output_path)
+
+    # Return whether any budget was written (either per-task or distributed total)
+    return wrote_any_budget or any_per_task_budget or (total_budget is not None)
 
 # -------------------- CLEANUP --------------------
 def cleanup_temp_files():
@@ -455,14 +473,15 @@ def run_agent(scope_text, gantt_template, budget_template):
     project_name = sanitize_title(data.get("project_name", "")) or infer_project_name(scope_text) or "Project"
     project_start_date = data.get("project_start_date")
     tasks = data.get("tasks", [])
+    total_budget = to_number(data.get("project_total_budget"))
 
     gantt_out = f"filled_gantt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     budget_out = f"filled_budget_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
     fill_gantt_excel(gantt_template, gantt_out, project_name, project_start_date, tasks)
-    fill_budget_excel(budget_template, budget_out, project_name, project_start_date, tasks)
+    budgets_written = fill_budget_excel(budget_template, budget_out, project_name, project_start_date, tasks, total_budget=total_budget)
 
-    return gantt_out, budget_out
+    return gantt_out, budget_out, budgets_written
 
 # -------------------- STREAMLIT UI --------------------
 st.set_page_config(page_title="Proja: Project Planning AI Agent", page_icon="📊", layout="centered")
@@ -501,7 +520,7 @@ budget_template = "Budget template.xlsx"
 
 def handle_scope_input(scope_input):
     try:
-        gantt_path, budget_path = run_agent(scope_input, gantt_template, budget_template)
+        gantt_path, budget_path, budgets_written = run_agent(scope_input, gantt_template, budget_template)
         with st.container():
             st.markdown("#### 📦 Download Results")
             with open(gantt_path, "rb") as f1:
@@ -518,6 +537,8 @@ def handle_scope_input(scope_input):
                     file_name=budget_template,  # left unchanged per your request
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+        if not budgets_written:
+            st.warning("Please enter budget for each task")
         st.success("✅ Files created and ready for download.")
         cleanup_temp_files()
     except Exception as e:
