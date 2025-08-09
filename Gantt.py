@@ -503,7 +503,7 @@ st.markdown(
       <li>Get a Gantt Chart and Budget Excel – ready for download.</li>
       <li>Agent will only answer project breakdown, Gantt chart, or budget requests.</li>
     
-      <li><b>This is merely a tool and is capable of producing errors. Users/project managers must use their discretion and review the documents carefully especially documents related to costs/budgeting.</b></li>
+      <li><b>Disclaimer: This tool generates automated outputs and may contain errors or omissions. Always review and validate all results—especially cost and budget figures—and apply professional judgment before acting. You are responsible for final approval.</b></li>
       </ul>
     </div>
     """,
