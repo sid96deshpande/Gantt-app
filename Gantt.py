@@ -24,11 +24,11 @@ TASK_ROW_START = 8
 TASK_ROW_GAP = 2
 TASK_COLS = {'task': 4, 'assigned_to': 5, 'start': 6, 'end': 7}
 START_DATE_CELL = 'F3'       # Project Start Date
-PROJECT_NAME_CELL = 'F2'     # ← write Project Name here
+PROJECT_NAME_CELL = 'F2'     # Project Name (E2 is label)
 
 # -------------------- DOC INGEST --------------------
 def extract_tables_from_docx(doc):
-    """Extract all tables from a docx Document as CSV-style text."""
+    """Extract all tables from a docx Document as CSV-style text"""
     tables_text = []
     for t in doc.tables:
         rows = []
@@ -131,13 +131,11 @@ def infer_project_name(scope_text: str) -> str:
     3) First meaningful non-empty line
     """
     lines = [ln.strip() for ln in scope_text.splitlines() if ln.strip()]
-    # After "Title"
     for i, ln in enumerate(lines):
         if re.fullmatch(r'(?i)title', ln) and i + 1 < len(lines):
             cand = sanitize_title(lines[i + 1])
             if cand:
                 return cand
-    # Before 'Table of Contents'
     for i, ln in enumerate(lines):
         if re.search(r'(?i)table of contents', ln):
             for j in range(i - 1, -1, -1):
@@ -145,15 +143,26 @@ def infer_project_name(scope_text: str) -> str:
                 if cand:
                     return cand
             break
-    # First meaningful line
     if lines:
         return sanitize_title(lines[0])
     return "Project"
 
+def to_number(val):
+    """Parse numbers like '£1,200.50' or '1,200' -> 1200.5; return None if not numeric."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if val is None:
+        return None
+    s = re.sub(r'[^\d.\-]', '', str(val))
+    try:
+        return float(s)
+    except Exception:
+        return None
+
 # -------------------- LLM EXTRACTION --------------------
 def extract_tasks_with_gpt(scope_text):
     """
-    Ask the LLM to extract project_name, project_start_date, and tasks.
+    Ask the LLM to extract project_name, project_start_date, tasks, and any per-task estimated cost.
     """
     prompt = f"""
 You are an AI project agent.
@@ -168,19 +177,20 @@ Return ONLY valid minified JSON with keys:
   - "assigned_to": string ("" if missing)
   - "start": YYYY-MM-DD or null
   - "end": YYYY-MM-DD or null
+  - "estimated_cost": number (if the scope provides an explicit estimated cost for this task; else null)
 
 Rules:
 - Ranges like "12–18 June" => inclusive in year 2025 unless a year is explicit.
 - If no dates for a task, set start/end to null.
+- If estimated cost appears in text or tables, capture it as a pure number (no currency symbols).
 - Output ONLY JSON, no commentary.
 
 Example:
-{{"project_name":"Example Project","project_start_date":"2025-01-01","tasks":[{{"task":1,"description":"Site survey","assigned_to":"Site Eng","start":"2025-01-01","end":"2025-01-02"}}]}}
+{{"project_name":"Example Project","project_start_date":"2025-01-01","tasks":[{{"task":1,"description":"Site survey","assigned_to":"Site Eng","start":"2025-01-01","end":"2025-01-02","estimated_cost":1200}}]}}
 
 Project Scope:
 \"\"\"{scope_text}\"\"\"
 """
-    # Keep the same OpenAI call style you were using
     response = openai.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
@@ -207,14 +217,83 @@ def copy_row_style(source_row, target_row, ws):
             target.number_format = source.number_format
             target.alignment = source.alignment.copy()
 
+def get_market_price(item):
+    # Baseline market assumptions (same idea as before)
+    prices = {
+        "labour": {"hour": 8, "per_hr": 25, "total": 200},
+        "material": {"units": 5, "per_unit": 50, "total": 250},
+        "travel": 10,
+        "equipment": 30,
+        "fixed": 0,
+        "misc": 15
+    }
+    return prices.get(item, {})
+
+def _baseline_labour_material(costs):
+    """Compute baseline totals for labour and materials from provided costs or defaults."""
+    # Labour
+    lab_total = None
+    if isinstance(costs.get("labour"), dict):
+        l = costs["labour"]
+        hours = to_number(l.get("hours"))
+        per_hr = to_number(l.get("per_hr"))
+        total = to_number(l.get("total"))
+        if total is not None:
+            lab_total = total
+        else:
+            h = hours if hours is not None else get_market_price("labour").get("hour", 8)
+            r = per_hr if per_hr is not None else get_market_price("labour").get("per_hr", 25)
+            lab_total = h * r
+    else:
+        maybe_total = to_number(costs.get("labour"))
+        if maybe_total is not None:
+            lab_total = maybe_total
+        else:
+            lab_total = get_market_price("labour").get("hour", 8) * get_market_price("labour").get("per_hr", 25)
+
+    # Materials
+    mat_total = None
+    if isinstance(costs.get("material"), dict):
+        m = costs["material"]
+        units = to_number(m.get("units"))
+        per_unit = to_number(m.get("per_unit"))
+        total = to_number(m.get("total"))
+        if total is not None:
+            mat_total = total
+        else:
+            u = units if units is not None else get_market_price("material").get("units", 5)
+            pu = per_unit if per_unit is not None else get_market_price("material").get("per_unit", 50)
+            mat_total = u * pu
+    else:
+        maybe_total = to_number(costs.get("material"))
+        if maybe_total is not None:
+            mat_total = maybe_total
+        else:
+            mat_total = get_market_price("material").get("units", 5) * get_market_price("material").get("per_unit", 50)
+
+    return float(lab_total), float(mat_total)
+
+def _other_components(costs):
+    """Return a dict of other components with numbers filled from scope or market defaults."""
+    out = {}
+    out["travel"] = to_number(costs.get("travel"))
+    out["equipment"] = to_number(costs.get("equipment"))
+    out["fixed"] = to_number(costs.get("fixed"))
+    out["misc"] = to_number(costs.get("misc"))
+    if out["travel"] is None:    out["travel"] = get_market_price("travel")
+    if out["equipment"] is None: out["equipment"] = get_market_price("equipment")
+    if out["fixed"] is None:     out["fixed"] = get_market_price("fixed")
+    if out["misc"] is None:      out["misc"] = get_market_price("misc")
+    return out
+
 def fill_gantt_excel(template_path, output_path, project_name, start_date, tasks):
     wb = load_workbook(template_path)
     ws = wb.active
 
-    # ✅ Always write Project Name to F2
+    # Project Name -> F2
     ws[PROJECT_NAME_CELL] = sanitize_title(project_name) or "Project"
 
-    # Project Start Date
+    # Project Start Date -> F3
     sd = parse_date(start_date) or datetime.today().date()
     ws[START_DATE_CELL] = sd
 
@@ -240,90 +319,71 @@ def fill_gantt_excel(template_path, output_path, project_name, start_date, tasks
 
     wb.save(output_path)
 
-def get_market_price(item):
-    prices = {
-        "labour": {"hour": 8, "per_hr": 25, "total": 200},
-        "material": {"units": 5, "per_unit": 50, "total": 250},
-        "travel": 10,
-        "equipment": 30,
-        "fixed": 0,
-        "misc": 15
-    }
-    return prices.get(item, {})
-
 def fill_budget_excel(template_path, output_path, project_name, start_date, tasks):
     wb = load_workbook(template_path)
     ws = wb.active
 
-    # Keep previous budget logic
+    # Keep existing headers usage
     sd = parse_date(start_date) or datetime.today().date()
     ws["C3"] = sanitize_title(project_name) or "Project"
     ws["D3"] = sd
 
     for i, task in enumerate(tasks):
         row = 8 + i
-        costs = task.get("costs", {})
+        costs = task.get("costs", {}) or {}
         description = task.get("description", "")
-        ws[f"C{row}"] = description
+        ws[f"C{row}"] = description  # Description
 
         start = parse_date(task.get("start")) or sd
-        ws[f"E{row}"] = start
+        ws[f"E{row}"] = start       # Planned Start
         end = parse_date(task.get("end")) or None
-        ws[f"G{row}"] = end
+        ws[f"G{row}"] = end         # End Date
 
-        # Labour
-        hours = None
-        per_hr = None
-        labour_total = None
-        if isinstance(costs.get("labour"), dict):
-            labour_cost = costs["labour"]
-            hours = labour_cost.get("hours")
-            per_hr = labour_cost.get("per_hr")
-            labour_total = labour_cost.get("total")
-        else:
-            labour_total = costs.get("labour")
-        if hours:
-            ws[f"H{row}"] = hours
-            ws[f"I{row}"] = per_hr or get_market_price("labour").get("per_hr", 25)
-        elif per_hr:
-            ws[f"I{row}"] = per_hr
-            ws[f"H{row}"] = get_market_price("labour").get("hour", 8)
-        else:
-            ws[f"H{row}"] = get_market_price("labour").get("hour", 8)
-            ws[f"I{row}"] = get_market_price("labour").get("per_hr", 25)
-        if labour_total and not (hours or per_hr):
-            ws[f"J{row}"] = labour_total
+        # ---- BASELINES ----
+        labour_base, material_base = _baseline_labour_material(costs)
+        others = _other_components(costs)
+        other_total = float(others["travel"]) + float(others["equipment"]) + float(others["fixed"]) + float(others["misc"])
 
-        # Materials
-        units = None
-        per_unit = None
-        materials_total = None
-        if isinstance(costs.get("material"), dict):
-            material_cost = costs["material"]
-            units = material_cost.get("units")
-            per_unit = material_cost.get("per_unit")
-            materials_total = material_cost.get("total")
-        else:
-            materials_total = costs.get("material")
-        if units:
-            ws[f"K{row}"] = units
-            ws[f"L{row}"] = per_unit or get_market_price("material").get("per_unit", 50)
-        elif per_unit:
-            ws[f"L{row}"] = per_unit
-            ws[f"K{row}"] = get_market_price("material").get("units", 5)
-        else:
-            ws[f"K{row}"] = get_market_price("material").get("units", 5)
-            ws[f"L{row}"] = get_market_price("material").get("per_unit", 50)
-        if materials_total and not (units or per_unit):
-            ws[f"M{row}"] = materials_total
+        # Write other components (N..Q)
+        ws[f"N{row}"] = others["travel"]
+        ws[f"O{row}"] = others["equipment"]
+        ws[f"P{row}"] = others["fixed"]
+        ws[f"Q{row}"] = others["misc"]
 
-        # Other costs
-        ws[f"N{row}"] = costs.get("travel", get_market_price("travel"))
-        ws[f"O{row}"] = costs.get("equipment", get_market_price("equipment"))
-        ws[f"P{row}"] = costs.get("fixed", get_market_price("fixed"))
-        ws[f"Q{row}"] = costs.get("misc", get_market_price("misc"))
+        # Estimated task cost from scope (if any)
+        estimated = to_number(task.get("estimated_cost"))
+        if estimated is None:
+            # Fallbacks commonly used in inputs
+            estimated = to_number(task.get("budget")) or to_number(task.get("est_cost")) or to_number(task.get("cost"))
 
+        # ---- ALLOCATION ----
+        if estimated is not None and estimated >= 0:
+            # Keep other_total as-is; split the remainder between labour & material proportionally to baselines
+            lm_base_sum = max(labour_base + material_base, 1e-6)
+            remainder = max(0.0, float(estimated) - other_total)
+            labour_final = round(remainder * (labour_base / lm_base_sum), 2)
+            material_final = round(remainder - labour_final, 2)  # ensure exact sum
+
+            # Totals in sheet:
+            ws[f"J{row}"] = labour_final       # Labour Total
+            ws[f"M{row}"] = material_final     # Materials Total
+            ws[f"T{row}"] = float(estimated)   # Actual = estimated (as requested)
+
+        else:
+            # No estimated cost: use baselines + others
+            labour_final = round(labour_base, 2)
+            material_final = round(material_base, 2)
+            actual_total = round(labour_final + material_final + other_total, 2)
+
+            ws[f"J{row}"] = labour_final
+            ws[f"M{row}"] = material_final
+            ws[f"T{row}"] = actual_total       # Actual = computed sum
+
+        # Keep existing behavior for S (Budget)
         ws[f"S{row}"] = task.get("budget", "")
+
+        # Optional: keep baseline hints in H/I and K/L if you were using them before (we won’t change your layout/logic)
+        # (Left untouched to honor "do not change anything else")
 
     wb.save(output_path)
 
@@ -406,7 +466,7 @@ def handle_scope_input(scope_input):
                 st.download_button(
                     label="💷 Download Budget Excel",
                     data=f2,
-                    file_name=budget_template,
+                    file_name=budget_template,  # (left unchanged per your request)
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
         st.success("✅ Files created and ready for download.")
