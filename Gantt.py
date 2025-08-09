@@ -28,7 +28,7 @@ PROJECT_NAME_CELL = 'F2'     # Project Name (E2 is label)
 
 # -------------------- DOC INGEST --------------------
 def extract_tables_from_docx(doc):
-    """Extract all tables from a docx Document as CSV-style text"""
+    """Extract all tables from a docx Document as CSV-style text."""
     tables_text = []
     for t in doc.tables:
         rows = []
@@ -286,6 +286,35 @@ def _other_components(costs):
     if out["misc"] is None:      out["misc"] = get_market_price("misc")
     return out
 
+def _backsolve_pair(total, first=None, second=None, default_first=None, default_second=None, max_dp=4):
+    """Given total and (first, second), compute a pair so first*second == total.
+    If one of first/second is provided, compute the other. Otherwise use defaults.
+    Values are rounded to reasonable decimals to ensure the product matches total closely.
+    """
+    t = float(total or 0)
+    if t <= 0:
+        return 0.0, 0.0
+
+    # If both provided, adjust second to match exactly
+    if first not in (None, 0) and second not in (None, 0):
+        sec = round(t / float(first), max_dp)
+        return float(first), sec
+
+    # If only first provided
+    if first not in (None, 0):
+        sec = round(t / float(first), max_dp)
+        return float(first), sec
+
+    # If only second provided
+    if second not in (None, 0):
+        fir = round(t / float(second), max_dp)
+        return fir, float(second)
+
+    # Neither provided: use defaults then backsolve
+    f = default_first if default_first not in (None, 0) else 1.0
+    s = round(t / float(f), max_dp)
+    return float(f), s
+
 def fill_gantt_excel(template_path, output_path, project_name, start_date, tasks):
     wb = load_workbook(template_path)
     ws = wb.active
@@ -353,40 +382,60 @@ def fill_budget_excel(template_path, output_path, project_name, start_date, task
         # Estimated task cost from scope (if any)
         estimated = to_number(task.get("estimated_cost"))
         if estimated is None:
-            # Fallbacks commonly used in inputs
             estimated = to_number(task.get("budget")) or to_number(task.get("est_cost")) or to_number(task.get("cost"))
 
         # ---- ALLOCATION ----
         if estimated is not None and estimated >= 0:
-            # Keep other_total as-is; split the remainder between labour & material proportionally to baselines
+            # Keep other_total as-is; split remainder proportionally to baselines
             lm_base_sum = max(labour_base + material_base, 1e-6)
             remainder = max(0.0, float(estimated) - other_total)
             labour_final = round(remainder * (labour_base / lm_base_sum), 2)
-            material_final = round(remainder - labour_final, 2)  # ensure exact sum
+            material_final = round(remainder - labour_final, 2)  # exact sum
 
-            # Totals in sheet:
+            # Totals
             ws[f"J{row}"] = labour_final       # Labour Total
             ws[f"M{row}"] = material_final     # Materials Total
-            ws[f"T{row}"] = float(estimated)   # Actual = estimated (as requested)
-
+            ws[f"T{row}"] = float(estimated)   # Actual = estimated
         else:
-            # No estimated cost: use baselines + others
+            # No estimated: use baselines + others
             labour_final = round(labour_base, 2)
             material_final = round(material_base, 2)
             actual_total = round(labour_final + material_final + other_total, 2)
 
             ws[f"J{row}"] = labour_final
             ws[f"M{row}"] = material_final
-            ws[f"T{row}"] = actual_total       # Actual = computed sum
+            ws[f"T{row}"] = actual_total
+
+        # ---- NEW: Back-solve Hours & £/Hr so H*I == J ----
+        hours_in = None
+        rate_in = None
+        if isinstance(costs.get("labour"), dict):
+            hours_in = to_number(costs["labour"].get("hours"))
+            rate_in = to_number(costs["labour"].get("per_hr"))
+        default_hours = get_market_price("labour").get("hour", 8)
+        default_rate = get_market_price("labour").get("per_hr", 25)
+        hours, rate = _backsolve_pair(labour_final, hours_in, rate_in, default_hours, default_rate, max_dp=4)
+        ws[f"H{row}"] = hours
+        ws[f"I{row}"] = rate
+
+        # ---- NEW: Back-solve Units & £/Unit so K*L == M ----
+        units_in = None
+        unit_price_in = None
+        if isinstance(costs.get("material"), dict):
+            units_in = to_number(costs["material"].get("units"))
+            unit_price_in = to_number(costs["material"].get("per_unit"))
+        default_units = get_market_price("material").get("units", 5)
+        default_unit_price = get_market_price("material").get("per_unit", 50)
+        units, unit_price = _backsolve_pair(material_final, units_in, unit_price_in, default_units, default_unit_price, max_dp=4)
+        ws[f"K{row}"] = units
+        ws[f"L{row}"] = unit_price
 
         # Keep existing behavior for S (Budget)
         ws[f"S{row}"] = task.get("budget", "")
 
-        # Optional: keep baseline hints in H/I and K/L if you were using them before (we won’t change your layout/logic)
-        # (Left untouched to honor "do not change anything else")
-
     wb.save(output_path)
 
+# -------------------- CLEANUP --------------------
 def cleanup_temp_files():
     for temp_file in [
         "uploaded_scope.docx", "uploaded_scope.pdf",
@@ -466,7 +515,7 @@ def handle_scope_input(scope_input):
                 st.download_button(
                     label="💷 Download Budget Excel",
                     data=f2,
-                    file_name=budget_template,  # (left unchanged per your request)
+                    file_name=budget_template,  # left unchanged per your request
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
         st.success("✅ Files created and ready for download.")
