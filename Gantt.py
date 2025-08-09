@@ -502,7 +502,9 @@ st.markdown(
       <li>Upload your project scope <b>.docx</b>, <b>.pdf</b> <i>or</i> type your project details below.</li>
       <li>Get a Gantt Chart and Budget Excel – ready for download.</li>
       <li>Agent will only answer project breakdown, Gantt chart, or budget requests.</li>
-    </ul>
+    
+      <li><b>This is merely a tool and is capable of producing errors. Users/project managers must use their discretion and review the documents carefully especially documents related to costs/budgeting.</b></li>
+      </ul>
     </div>
     """,
     unsafe_allow_html=True,
